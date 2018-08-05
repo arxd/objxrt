@@ -1,0 +1,14 @@
+#src
+Import('env')
+env = env.Clone()
+env.Append(CCFLAGS="")
+#~ src = ['main.c', 'logging.c',  'avltree.c', 'packmem.c', 'intstr.c', 'objid.c', 'linkedlist.c','objmem.c', 'links.c']
+#~ if Platform().name == 'win32':
+	#~ src += ['subproc_w.c', 'share_mem_w.c']
+#~ else:
+	#~ src += ['subproc.c', 'share.c']
+#~ env.GLSL('shaders')
+#~ objmem = env.Object()
+test_avltree = env.Program('test_avltree', ['logging.c', 'avltree.c', 'avltree_test.c'], LIBS=[])
+test_intstr = env.Program('test_intstr', ['logging.c', 'avltree.c', 'intstr.c', 'intstr_test.c'], LIBS=[])
+#~ pixie_exe = env.Program('link', src, LIBS=['m'])#, LINKFLAGS=["-Wl,--defsym=O=0"])
