@@ -1,25 +1,27 @@
 /**
 
-small_obj - 64 bytes
-tiny_obj = 8 bytes
-
-
-
 */
 #ifndef OBJ_C
 #define OBJ_C
 
-#include <stdint.h>
+void obj_free(ObjID obj);
 
-#define PAGE_SIZE 4096
+int obj_get_data(ObjID objid, void **ptr);
+void obj_set_data(ObjID objid, int bytes, void **ptr);
 
-typedef uint32_t ObjID;
-
-void obj_init(void);
-void obj_fini(void);
 
 
 #if __INCLUDE_LEVEL__ == 0
+
+#include <unistd.h>
+#include <sys/mman.h>
+#include "logging.c"
+
+
+
+
+
+
 
 #endif
 #endif

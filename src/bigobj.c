@@ -68,7 +68,7 @@ struct s_SlotIter {
 	int i, page_i, bobj_i;
 };
 
-extern Bobject *g_objmem;
+extern Bobject *g_bobjmem;
 
 void bobj_init(uint32_t max_objects);
 void bobj_fini(void);
@@ -114,7 +114,7 @@ int iter_keys_next(SlotIter *iter);
 #include <sys/mman.h>
 #include "logging.c"
 
-Bobject *g_objmem;
+Bobject *g_bobjmem;
 static ObjID *g_free_top;
 static uint32_t g_max_objects;
 
@@ -124,22 +124,22 @@ void bobj_init(uint32_t max_objects)
 {
 	g_max_objects = max_objects;
 	ASSERT(sizeof(Bobject) == PAGE_SIZE, "%d", sizeof(Bobject)); 
-	g_objmem = mmap(0, g_max_objects*sizeof(Bobject), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, 0, 0);
-	ASSERT(g_objmem != MAP_FAILED, "Can't mmap for default objects");
-	g_free_top = (ObjID*)g_objmem;
+	g_bobjmem = mmap(0, g_max_objects*sizeof(Bobject), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, 0, 0);
+	ASSERT(g_bobjmem != MAP_FAILED, "Can't mmap %dMbytes for big objects", g_max_objects*sizeof(Bobject)/1024/1024);
+	g_free_top = (ObjID*)g_bobjmem;
 	g_free_top[0] = 1;
 }
 
 void bobj_fini(void)
 {
-	ASSERT(munmap(g_objmem, g_max_objects*sizeof(Bobject)) == 0, "Failed to unmap object mem");
+	ASSERT(munmap(g_bobjmem, g_max_objects*sizeof(Bobject)) == 0, "Failed to unmap object mem");
 }
 
 ObjID bobj_alloc(void)
 {
 	ObjID obj;
 	if((uint64_t)g_free_top % PAGE_SIZE == 0) { // this free list is empty
-		if (g_free_top == (ObjID*)g_objmem) { 
+		if (g_free_top == (ObjID*)g_bobjmem) { 
 			// this is the root free list.  Grab the page from the end
 			obj = g_free_top[0];
 			if (g_free_top[0] == g_max_objects)
@@ -148,8 +148,8 @@ ObjID bobj_alloc(void)
 		} else {
 			// there is another page of free pages.
 			// use this page as the object and follow the link
-			obj = (Bobject*)g_free_top - g_objmem;
-			g_free_top = (ObjID*)&g_objmem[*g_free_top] - 1;
+			obj = (Bobject*)g_free_top - g_bobjmem;
+			g_free_top = (ObjID*)&g_bobjmem[*g_free_top] - 1;
 		}
 	} else {
 		// just a normal free page
@@ -157,23 +157,23 @@ ObjID bobj_alloc(void)
 		--g_free_top;
 		
 	}
-	memset(&g_objmem[obj], 0, PAGE_SIZE);
+	memset(&g_bobjmem[obj], 0, PAGE_SIZE);
 	return obj;
 }
 
 void bobj_free(ObjID obj)
 {
-	if (g_objmem[obj][OPP-1])
-		bobj_free(g_objmem[obj][OPP-1]);
+	if (g_bobjmem[obj][OPP-1])
+		bobj_free(g_bobjmem[obj][OPP-1]);
 	++g_free_top;
 	// add this object to the free list
 	if ((uint64_t)g_free_top%PAGE_SIZE == 0) {
 		// this list is full, so use this object as the new list
-		g_objmem[obj][0] = (Bobject*)g_free_top - g_objmem;
-		g_free_top = &g_objmem[obj][0];
+		g_bobjmem[obj][0] = (Bobject*)g_free_top - g_bobjmem;
+		g_free_top = &g_bobjmem[obj][0];
 	} else {
 		*g_free_top = obj;
-		ASSERT(madvise(&g_objmem[obj], PAGE_SIZE, MADV_DONTNEED) == 0, "madvise failed");
+		ASSERT(madvise(&g_bobjmem[obj], PAGE_SIZE, MADV_DONTNEED) == 0, "madvise failed");
 	}
 }
 
@@ -192,7 +192,7 @@ static ObjID *jump_to(Bobject **page, int *index)
 		*index = idx % (OPP-1);
 	}
 	while (pg -- )
-		*page = &g_objmem[(**page)[OPP-1]];
+		*page = &g_bobjmem[(**page)[OPP-1]];
 	return &(**page)[*index];
 }
 
@@ -200,7 +200,7 @@ static int names_search(Bobject **page, int *index, IStr key)
 {
 	while ((**page)[*index]) {
 		if (*index == OPP - 1) {
-			*page = &g_objmem[(**page)[*index]];
+			*page = &g_bobjmem[(**page)[*index]];
 			*index = 1;
 		}
 		if ((**page)[*index] == key)
@@ -213,8 +213,8 @@ static int names_search(Bobject **page, int *index, IStr key)
 
 static void insert_at(ObjID obji, int index, ObjID value)
 {
-	Bobject *page = &g_objmem[obji];
-	int end = g_objmem[obji][0];
+	Bobject *page = &g_bobjmem[obji];
+	int end = g_bobjmem[obji][0];
 	int idx = index;
 	
 	jump_to(&page, &idx);
@@ -228,13 +228,13 @@ static void insert_at(ObjID obji, int index, ObjID value)
 		if (idx == OPP-1) { // go to next page
 			if ((*page)[idx] == 0)
 				(*page)[idx] = bobj_alloc();
-			page = &g_objmem[(*page)[idx]];
+			page = &g_bobjmem[(*page)[idx]];
 			idx = 0;
 		}
 	}
 	
-	ASSERT(g_objmem[obji][0] < MAX_LINKS, "Out of link memory!");
-	g_objmem[obji][0] += 1;
+	ASSERT(g_bobjmem[obji][0] < MAX_LINKS, "Out of link memory!");
+	g_bobjmem[obji][0] += 1;
 	
 	if ((*page)[idx]) { // Need to move a name/val pair to make room
 		bobj_set_istr(obji, (*page)[idx], (*page)[idx+1]);
@@ -248,7 +248,7 @@ static void insert_at(ObjID obji, int index, ObjID value)
 
 ObjID bobj_parent_at(ObjID obj, int index, ObjID parent)
 {
-	int num = g_objmem[obj][0] - g_objmem[obj][1];
+	int num = g_bobjmem[obj][0] - g_bobjmem[obj][1];
 	if (index < 0)
 		index += num+1;
 	ASSERT(index >= 0 && index <= num, "index out of bounds 0 <= %d [%d]", num, index);
@@ -276,7 +276,7 @@ ObjID bobj_get_utf8(ObjID obj, const char *key_utf8)
 
 ObjID _bobj_get_istr(ObjID obj, IStr key)
 {
-	Bobject *page = &g_objmem[obj];
+	Bobject *page = &g_bobjmem[obj];
 	int idx = (int)(*page)[1];
 	jump_to(&page, &idx);
 	if (idx % 2 == 0)
@@ -293,8 +293,8 @@ ObjID bobj_get_istr(ObjID obj, IStr key_istr)
 	ObjID val = _bobj_get_istr(obj, key_istr);
 	if (val)
 		return val;
-	int nparents = g_objmem[obj][0] - g_objmem[obj][1];
-	Bobject *page = &g_objmem[obj];
+	int nparents = g_bobjmem[obj][0] - g_bobjmem[obj][1];
+	Bobject *page = &g_bobjmem[obj];
 	int idx = 2;
 	while (nparents--) {
 		val = bobj_get_istr((*page)[idx], key_istr);
@@ -302,7 +302,7 @@ ObjID bobj_get_istr(ObjID obj, IStr key_istr)
 			return val;
 		idx++;
 		if (idx == OPP-1) {
-			page = &g_objmem[(*page)[idx]];
+			page = &g_bobjmem[(*page)[idx]];
 			idx = 0;
 		}
 	}
@@ -311,12 +311,12 @@ ObjID bobj_get_istr(ObjID obj, IStr key_istr)
 
 ObjID bobj_get_idx(ObjID obj, int index)
 {
-	Bobject *page = &g_objmem[obj];
+	Bobject *page = &g_bobjmem[obj];
 	if (index < 0)
-		index += g_objmem[obj][1];
-	if (index < 0 || index >= g_objmem[obj][1])
+		index += g_bobjmem[obj][1];
+	if (index < 0 || index >= g_bobjmem[obj][1])
 		return 0; // out of bounds
-	index += g_objmem[obj][0] - g_objmem[obj][1];
+	index += g_bobjmem[obj][0] - g_bobjmem[obj][1];
 	return *jump_to(&page, &index);
 }
 
@@ -328,20 +328,20 @@ index -1 appends the object to the end (push)
 */
 ObjID bobj_ins_idx(ObjID obj, int index, ObjID val)
 {
-	g_objmem[obj][1] ++;
+	g_bobjmem[obj][1] ++;
 	if (index < 0)
-		index += g_objmem[obj][1];
-	ASSERT(index >= 0 && index <= g_objmem[obj][1], "index out of bounds 0 <= %d [%d]", g_objmem[obj][1], index);
-	insert_at(obj, g_objmem[obj][0] - (g_objmem[obj][1]-1) + index, val);
+		index += g_bobjmem[obj][1];
+	ASSERT(index >= 0 && index <= g_bobjmem[obj][1], "index out of bounds 0 <= %d [%d]", g_bobjmem[obj][1], index);
+	insert_at(obj, g_bobjmem[obj][0] - (g_bobjmem[obj][1]-1) + index, val);
 	return obj;
 }
 
 ObjID bobj_set_idx(ObjID obj, int index, ObjID val)
 {
-	Bobject *o = &g_objmem[obj];
+	Bobject *o = &g_bobjmem[obj];
 	if (index < 0)
-		index += g_objmem[obj][1];
-	ASSERT(index >= 0 && index < g_objmem[obj][1], "index out of bounds 0 < %d  [%d]", 0, g_objmem[obj][1], index);
+		index += g_bobjmem[obj][1];
+	ASSERT(index >= 0 && index < g_bobjmem[obj][1], "index out of bounds 0 < %d  [%d]", 0, g_bobjmem[obj][1], index);
 	ObjID *x = jump_to(&o, &index);
 	*x = val;
 	return obj;
@@ -354,15 +354,15 @@ ObjID bobj_set_utf8(ObjID obj, const char *key_utf8, ObjID val)
 
 ObjID bobj_set_istr(ObjID obj, IStr key_istr, ObjID val)
 {
-	Bobject *page = &g_objmem[obj];
-	int idx = g_objmem[obj][0]; 
+	Bobject *page = &g_bobjmem[obj];
+	int idx = g_bobjmem[obj][0]; 
 	jump_to(&page, &idx);
 	if (idx % 2 == 0)
 		idx++;	
 	if (!names_search(&page, &idx, key_istr)) {
 		if (idx == OPP - 1) { // need some more memory
 			(*page)[idx] = bobj_alloc();
-			page = &g_objmem[(*page)[idx]];
+			page = &g_bobjmem[(*page)[idx]];
 			idx = 1;
 		}
 		(*page)[idx] = key_istr;
@@ -376,7 +376,7 @@ ObjID bobj_set_istr(ObjID obj, IStr key_istr, ObjID val)
 
 int bobj_length(ObjID obj)
 {
-	return g_objmem[obj][1];
+	return g_bobjmem[obj][1];
 }
 
 
@@ -390,14 +390,14 @@ int is_bobj_page(ObjID pageid)
 			return 0; // this is a free page
 		
 		if ( (uint64_t)top % PAGE_SIZE == 0) {
-			if ( (Bobject*)top - g_objmem == pageid)
+			if ( (Bobject*)top - g_bobjmem == pageid)
 				return 0; // this is a page for free lists
-			if ( (Bobject*)top == g_objmem) {
+			if ( (Bobject*)top == g_bobjmem) {
 				if (pageid >= *top)
 					return 0; // this is a free page
 				return 1;
 			}
-			top = (ObjID*)&g_objmem[*top] - 1;
+			top = (ObjID*)&g_bobjmem[*top] - 1;
 		} else {
 			--top;
 		}
@@ -414,7 +414,7 @@ int iter_objs_next(ObjIter *iter)
 {
 	do {
 		++iter->obj;
-		if (iter->obj >= g_objmem[0][0])
+		if (iter->obj >= g_bobjmem[0][0])
 			return 0;
 	} while (!is_bobj_page(iter->obj));
 	return 1;
@@ -422,7 +422,7 @@ int iter_objs_next(ObjIter *iter)
 
 void iter_parents_init(SlotIter *iter, ObjID obj)
 {
-	iter->page = iter->page0 = &g_objmem[obj];
+	iter->page = iter->page0 = &g_bobjmem[obj];
 	iter->i = iter->bobj_i = -1;
 	iter->page_i = 1;
 	iter->objid = 0;
@@ -436,7 +436,7 @@ int iter_parents_next(SlotIter *iter)
 	if (iter->i >= ((*iter->page0)[0] - (*iter->page0)[1]))
 		return 0;
 	if (iter->page_i == OPP-1) {
-		iter->page = &g_objmem[(*iter->page)[OPP-1]];
+		iter->page = &g_bobjmem[(*iter->page)[OPP-1]];
 		iter->page_i = 0;
 	}
 	iter->objid = (*iter->page)[iter->page_i];
@@ -446,9 +446,9 @@ int iter_parents_next(SlotIter *iter)
 
 void iter_list_init(SlotIter *iter, ObjID obj)
 {
-	iter->page = iter->page0 = &g_objmem[obj];
+	iter->page = iter->page0 = &g_bobjmem[obj];
 	iter->i = -1;
-	iter->bobj_i = iter->page_i = g_objmem[obj][0] - g_objmem[obj][1];
+	iter->bobj_i = iter->page_i = g_bobjmem[obj][0] - g_bobjmem[obj][1];
 	iter->objid = *jump_to(&iter->page, &iter->page_i);
 }
 
@@ -462,7 +462,7 @@ int iter_list_next(SlotIter *iter)
 	++ iter->bobj_i;
 	++ iter->page_i;
 	if (iter->page_i == OPP-1) {
-		iter->page = &g_objmem[(*iter->page)[OPP-1]];
+		iter->page = &g_bobjmem[(*iter->page)[OPP-1]];
 		iter->page_i = 0;
 	}
 	iter->objid = (*iter->page)[iter->page_i];
@@ -471,9 +471,9 @@ int iter_list_next(SlotIter *iter)
 
 void iter_keys_init(SlotIter *iter, ObjID obj)
 {
-	iter->page = iter->page0 = &g_objmem[obj];
+	iter->page = iter->page0 = &g_bobjmem[obj];
 	iter->i = -1;
-	iter->bobj_i = iter->page_i = g_objmem[obj][0];
+	iter->bobj_i = iter->page_i = g_bobjmem[obj][0];
 	jump_to(&iter->page, &iter->page_i);
 	if (iter->page_i % 2 == 0)
 		++iter->page_i;
@@ -488,7 +488,7 @@ int iter_keys_next(SlotIter *iter)
 	if ((*iter->page)[iter->page_i] == 0)
 		return 0;
 	if (iter->page_i == OPP-1) {
-		iter->page = &g_objmem[(*iter->page)[OPP-1]];
+		iter->page = &g_bobjmem[(*iter->page)[OPP-1]];
 		iter->page_i = 1;
 	}
 	iter->objid = (*iter->page)[iter->page_i];
@@ -510,7 +510,7 @@ void bobj_graphviz(const char *filename)
 	iter_objs_init(&itr);
 	while (iter_objs_next(&itr)) {		
 		FOUT("N%u [label=\"<root> %u|{", itr.obj, itr.obj);
-		int nparents = g_objmem[itr.obj][0] - g_objmem[itr.obj][1];
+		int nparents = g_bobjmem[itr.obj][0] - g_bobjmem[itr.obj][1];
 		iter_parents_init(&sitr, itr.obj);
 		while(iter_parents_next(&sitr)) {
 			if (sitr.i) FOUT("|");
