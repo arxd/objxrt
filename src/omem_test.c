@@ -6,14 +6,13 @@
 void test_alloc(void)
 {
 	INFO("%d bytes / tiny", sizeof(TinyObj));
-	INFO("%d bytes / med", sizeof(MedObj));
-	INFO("%d bytes / big,  %d objs/big", sizeof(BigObj), OM_TPB);
+	INFO("%d bytes / page,  %d objs/page", sizeof(PageObj), OM_OPP);
 	
 	
 	omem_init(2);
-	ObjID x;
+	ORef x;
 	int nobj = 0;
-	while ( (x=omem_allocB())) {
+	while ( (x=omem_alloc_page())) {
 		INFO("%d", x);
 		++nobj;
 	}
@@ -21,25 +20,49 @@ void test_alloc(void)
 	omem_fini();
 }
 
-//~ void test_rand_alloc_free(void)
-//~ {
-	//~ bobj_init(1024*1024);
-	//~ srand(time(0));
-	//~ ObjID objs[1024] = {0};
-	//~ for (int i=0; i < 200000; ++i) {
-		//~ int z = rand()%1024;
-		//~ if (objs[z]) {
-		//	INFO("Free %x", objs[z]);
-			//~ bobj_free(objs[z]);
-			//~ objs[z] = 0;
-		//~ } else {
-			//~ objs[z] = bobj_alloc();
-			//INFO("Alloc %x", objs[z]);
-		//~ }
-	//~ }
+
+void test_rand_alloc_free(void)
+{
+	omem_init(1024*1024);
+	srand(time(0));
+	ORef objs[10021] = {0};
+	int nallocs = 0, nfrees=0, z;
+	for (int i=0; i < 10021; ++i)
+		objs[i] = omem_alloc_page();
+	for (int i=0; i < 200000; ++i) {
+		z = 0;
+		//~ for (int q=0; q<1024; ++q)
+			z += rand()%10021;
+		//~ z>>=10;
+		if ((i+1)%100000 == 0) {
+			ORef o = 0;
+			int p;
+			//~ dump_free_pages();
+			
+
+			while ((p = omem_page_in_use(o)) > -2) {
+				printf("%c", p==-1?'O':(p==0?'.':'X' ));
+				o += OM_OPP;
+			}
+			printf("\n %d allocs,  %d free\n", nallocs, nfrees);
+			return;
+		}
+		
+		if (objs[z]) {
+			//~ INFO("Free %x", objs[z]);
+			omem_free_page(objs[z]);
+			objs[z] = 0;
+			++nfrees;
+		} else {
+			if (z*101 % 3 ==0)
+			objs[z] = omem_alloc_page();
+			//~ INFO("Alloc %x", objs[z]);
+			++nallocs;
+		}
+	}
 	
-	//~ bobj_fini();
-//~ }
+	omem_fini();
+}
 
 //~ void dump(ObjID me)
 //~ {
@@ -147,7 +170,7 @@ void test_alloc(void)
 int main(int argc, char *argv[])
 {
 	test_alloc();
-	//~ test_rand_alloc_free();
+	test_rand_alloc_free();
 	//~ test_names();
 	//~ test_parents();
 
