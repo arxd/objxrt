@@ -1,27 +1,33 @@
 /**
-32 bit address space (ORef) indexs 8byte tiny objs
-29 bits of small objects (64 bytes)
+32 bit address space (ORef) indexes every 8 bytes sizeof(TinyObj)
+Every object starts with a 1 byte type which indexes into g_class[type] to get out-of-band information (size/parents/etc.)
+Type 0 is used for free objects.
+Type 1 is used for house-keeping objects.
+Types 2~255 are user defined.
 
-small_obj - 64 bytes
-tiny_obj = 8 bytes
+Memory allocation is done primarily by pages.
+The paging system (mmap) is used so that individual pages can be freed, while still keeping a linear space.
 
-tiny obj:
-1xxxxxxxxxxxx... = 63bit double number
-XXXXtttttttttttt = 32k classes (X 0002~7fff) with 6 bytes of payload (t)
-0002.......      = small_obj
+The first page is special, it holds bookkeeping information.
+The first PAGE_SIZE_BITS f16 objects are sentinals for the DLL free lists for each sized object.
+After the sentinals the rest of the page is used as the root page in the free-page-list.
 
-small_obj:
+The free-page-list is a SLL of pages that hold a stack of 32bit PageObjRefs to pages that are free.
+The reference to the next page in the SLL is at the root of the page in the FreeObj8.next space.
+The reference to the next page actually points to the page AFTER to facilitate easy entry into the top of the previous(actual) page.
+The first 8 bytes of the page are for the f8 object information (type=1, size=12, next=(PageObjRef)nextpage+1).
+After the first 8 bytes the stack of PageObjRefs proceeds upwards.  And pages are removed top to bottom.
+The global g_free_page is a (PageObjRef*) pointer to the top element of this stack.
 
-starts with 2 bytes of zero.  
-The next 4 bytes are an ORef of the zeroth parent.  It should describe the rest of the bytes.
-Then 58 bytes of object-specific data.
+g_free_page_root points somwhere into page0 where the stack starts.  
+The first PageObjRef (*g_free_page_root) is a free page, but so are all of the pages above it.
+The first PageObjRef (*g_free_page_root) will not be popped from the stack upon allocation, simply incremented.
 
-the first page holds the DLL sentenals
-each size from 3(8)~11(2048) gets two sentenals
-After the sentinals, the rest of the page is dedicated to ORefs for free pages.
-starting from ORef FREE_PAGE ROOT
-
-
+TODO:
+  sweep page free list to truncate tail pages and shrink *g_free_page_root
+  sweep tiny obj free list to combine terms
+  extendable objects with secondary free lists
+  
 */
 #ifndef OMEM_C
 #define OMEM_C
@@ -31,6 +37,7 @@ starting from ORef FREE_PAGE ROOT
 
 #define PAGE_SIZE_BITS 12
 #define OM_OPP (1<<(PAGE_SIZE_BITS-3))
+#define FLAG_HALF_FREE 0x1
 
 typedef union u_PageObj PageObj;
 typedef uint64_t TinyObj;
@@ -44,8 +51,8 @@ typedef uint32_t PageObjRef; // indexes every 16 bytes into OM.f16
 
 struct s_FreeObj8 {
 	uint8_t type;
-	uint8_t flags;
-	uint16_t size;
+	uint8_t size;
+	uint16_t flags;
 	ORef next; // f8
 };
 
@@ -53,9 +60,9 @@ struct s_FreeObj16 {
 	uint8_t type;
 	uint8_t flags;
 	uint16_t size;
-	uint32_t age;
-	FreeObjRef prev; // OM.f16
 	FreeObjRef next; // OM.f16
+	FreeObjRef prev; // OM.f16
+	uint32_t pad;
 };
 
 struct s_ObjClass {
@@ -71,15 +78,28 @@ union u_PageObj {
 	ORef r[OM_OPP*2];
 };
 
+union OM {
+	PageObj *p;
+	TinyObj *o;
+	FreeObj8 *f8;
+	FreeObj16 *f16;
+	ORef *r;
+};
+
 void omem_init(uint32_t pages);
 void omem_fini(void);
+void omem_register_class(uint8_t type, ObjClass *kls);
 
-ORef omem_alloc_page(void);
-ORef omem_alloc(uint8_t type);
-void dump_free_pages(void);
+PageObjRef omem_alloc_page(void);
+void omem_free_page(PageObjRef page);
 
-void omem_free_page(ORef page_obj);
+ORef omem_alloc(int size);
+void omem_free(ORef obj);
+
 int omem_page_in_use(ORef obj);
+
+extern union OM OM;
+extern PageObjRef *g_free_page, *g_free_page_root;
 
 #if __INCLUDE_LEVEL__ == 0
 
@@ -88,28 +108,9 @@ int omem_page_in_use(ORef obj);
 #include <sys/mman.h>
 #include "logging.c"
 
-union {
-	PageObj *p;
-	TinyObj *o;
-	FreeObj8 *f8;
-	FreeObj16 *f16;
-	ORef *r;
-} OM;
-
-
-
-ObjClass g_class[256] = {
-	{0, 0}, // free object
-	{0, 0}, // internal_use
-	{0, 0}, // user data
-	{0, 0}, // extension
-	{0}
-	
-};
-
+union OM OM;
+ObjClass g_class[256] = {0};
 uint32_t g_max_pages;
-uint32_t g_num_objects;
-uint32_t g_golden_offset;
 PageObjRef *g_free_page_root, *g_free_page;
 
 void omem_init(uint32_t pages)
@@ -119,20 +120,22 @@ void omem_init(uint32_t pages)
 	OM.p = mmap(0, g_max_pages*sizeof(PageObj), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, 0, 0);
 	ASSERT(OM.p != MAP_FAILED, "Can't mmap OM %dMbytes", g_max_pages*sizeof(PageObj)/1024/1024);
 	
-	g_num_objects = 1;        // the zeroth page is used
-	OM.f8[0].type = 1;   // It is classified as free-page-list
+	OM.f8[0].type = 1;   // It is classified as internal mem.  But it is also our NULL object
 	OM.f8[0].size = PAGE_SIZE_BITS;
-	g_free_page = g_free_page_root = (PageObjRef*)&OM.f16[PAGE_SIZE_BITS*2];
+	g_free_page = g_free_page_root = (PageObjRef*)&OM.f16[PAGE_SIZE_BITS];
 	*g_free_page = 1;
 	
 	// initialize sentenials for object sizes
-	for (int s = 3; s < PAGE_SIZE_BITS; ++s) {
-		OM.f16[s*1].type = OM.f16[s*2].type = 1;
-		OM.f16[s*1].size = OM.f16[s*2].size = 2;
-		OM.f16[s*1].next = OM.f16[s*1].prev = (s*1 << 1); // primary list
-		OM.f16[s*2].next = OM.f16[s*2].prev = (s*2 << 1); // secondary list
+	for (int s = 4; s < PAGE_SIZE_BITS; ++s) {
+		OM.f16[s*1].type = 1;
+		OM.f16[s*1].size = 4;
+		OM.f16[s*1].next = OM.f16[s*1].prev = s*1; // primary list
 	}
-		
+	OM.f16[3*1].type = 1;
+	OM.f16[3*1].size = 3;
+	OM.f16[3*1].next = 3*1;
+	
+
 }
 
 void omem_fini(void)
@@ -144,7 +147,7 @@ void omem_fini(void)
 
 ORef omem_alloc_page(void)
 {
-	uint32_t page;
+	PageObjRef page;
 	if (g_free_page == g_free_page_root) {
 		// no more free pages at all.  Grab the page from the end (stored at root position)
 		page = *g_free_page;
@@ -164,72 +167,150 @@ ORef omem_alloc_page(void)
 		page = *g_free_page;
 		--g_free_page;
 	}
+	
+	
 	memset(&OM.p[page], 0, sizeof(PageObj));
 	OM.p[page].f8[0].type = 1;
 	OM.p[page].f8[0].size = PAGE_SIZE_BITS;
-	return page * OM_OPP;	
+	XINFO("new page %d", page);
+	return page;	
 }
 
-void omem_free_page(ORef obj)
+void omem_free_page(PageObjRef page)
 {
-	//~ if (g_Bmem.t[obj][OPP-1])
-		//~ omem_free(g_bobjmem[obj][OPP-1]);
+	XINFO("Free page %d", page);
 	++g_free_page;
 	// add this object to the free list
 	if ( (g_free_page - OM.r)%(OM_OPP*2) == 0) { 
 		// this list is full, so use this object as the new list
-		OM.f8[obj].type = 1;
-		OM.f8[obj].size = PAGE_SIZE_BITS;
-		OM.f8[obj].next = (PageObj*)g_free_page - OM.p;
-		g_free_page = &OM.f8[obj].next;
+		OM.p[page].f8[0].type = 1;
+		OM.p[page].f8[0].size = PAGE_SIZE_BITS;
+		OM.p[page].f8[0].next = (PageObj*)g_free_page - OM.p;
+		g_free_page = &OM.p[page].f8[0].next;
 		
 	} else {
-		*g_free_page = obj / OM_OPP;
-		OM.f8[obj].type = 0;
-		//ASSERT(madvise(&OM.o[obj], sizeof(PageObj), MADV_DONTNEED) == 0, "madvise failed");
+		*g_free_page = page;
+		OM.p[page].f8[0].type = 0;
+		ASSERT(madvise(&OM.p[page], sizeof(PageObj), MADV_DONTNEED) == 0, "madvise failed");
 	}
 }
 
-ORef omem_alloc(uint8_t type)
+ORef omem_alloc(int size)
 {
+	ORef obj;
+	XXINFO("alloc size %d : %d", size, 1<<size);
+	if (size == PAGE_SIZE_BITS) {
+		obj = omem_alloc_page() * OM_OPP;
+		
+	} else if (size == 3) {
+		if (OM.f16[3*1].next == 3*1) { // no more, split an 8byte obj
+			obj = omem_alloc(4);
+			XXINFO("Split 8byte: %x", obj);
+			// free the friend
+			OM.f8[obj+1].type = 0;
+			OM.f8[obj+1].flags = 0; // fully free
+			OM.f8[obj+1].size = 3;
+			OM.f8[obj+1].next = OM.f16[3*1].next;
+			OM.f16[3*1].next = obj+1;
+			
+		} else {
+			obj = OM.f16[3*1].next;
+			OM.f16[3*1].next = OM.f8[obj].next;
+			XXINFO("Try %x: friend %x (%d:%d:%d)", obj, obj^1, OM.f8[obj^1].type, OM.f8[obj^1].flags, OM.f8[obj^1].size);
+			// before using obj, see if its friend is free
+			if (OM.f8[obj^1].type == 0) { // friend is also free so don't use this obj
+				OM.f8[obj].flags |= FLAG_HALF_FREE; // we are still free but not in the free list
+				if (OM.f8[obj^1].flags & FLAG_HALF_FREE) {
+					// our friend is also half-free (not in the free list)
+					// go ahead and free this whole 16bit block
+					obj &= ~1;
+					OM.f8[obj].type = 1;
+					OM.f8[obj].size = 4;
+					XXINFO("Free them both");
+					omem_free(obj);
+				}
+				// go get a new one
+				obj = omem_alloc(3);
+			}
+		}
+		
+	} else if (OM.f16[size*1].next == size*1) {
+		XXINFO("No free objs of size %d, alloc new one", size);
+		ORef big = omem_alloc(size+1) >> 1;
+		// add the frind to the primary list
+		obj = big + (1<<(size - 4));
+		OM.f16[obj].size = size;
+		OM.f16[obj].type = 0;
+		OM.f16[obj].next = OM.f16[size*1].next;
+		OM.f16[obj].prev = size*1;
+		OM.f16[OM.f16[obj].next].prev = obj;
+		OM.f16[size*1].next = obj;
+		obj = big << 1;
+		
+	} else {
+		XXINFO("Grab one from the list %d -> %d", size, OM.f16[size].next);
+		// Just grab it from the list
+		FreeObj16 *fo = &OM.f16[OM.f16[size*1].next];
+		OM.f16[fo->prev].next = fo->next;
+		OM.f16[fo->next].prev = fo->prev;
+		obj = (fo - OM.f16) << 1;
+	}
+	return obj;
 }
 
+
+//~ ORef omem_alloc(uint8_t type)
+//~ {
+	//~ XINFO("ALLOC %x : %d", type, g_class[type].size);
+	
+	//~ int size = g_class[type].size;
+	//~ ORef obj = omem_alloc_size(size);
+	//~ memset(&OM.o[obj], 0, 1<<size);
+	//~ OM.f8[obj].size = size;
+	//~ OM.f8[obj].type = type;
+	//~ return obj;
+//~ }
 
 void omem_free(ORef obj)
 {
 	// Free linked objects first somehow
 	FreeObj8 *o8 = &OM.f8[obj];
-	int size = g_class[o8->type].size;
+	int size = (o8->type==1)? o8->size: g_class[o8->type].size;
 	ASSERT(size != 0, "Double free");
+	XINFO("FREEE: %x by %x:%d (%d)", obj, o8->type, size, (1<<size)/8);
 	
 	if (size == 3) { // special rules for freeing an 8byte object
 		o8->type = 0; // it is now marked as free
 		o8->size = 3; // free an 8 byte object
-		o8->flags = 1; // only half free
+		o8->flags = 0; // make sure our FLAG_HALF_FREE is cleared
 		// link it into the primary free list
-		o8->next = OM.f16[3*1].next;
+		o8->next = OM.f16[3*1].next; // this next points to f8 not f16
 		OM.f16[3*1].next = obj;
 		
 	} else if (size == PAGE_SIZE_BITS) { // free an entire page
-		omem_free_page(obj);
+		omem_free_page(obj / OM_OPP);
 		
 	} else { // is our friend already free?
 		obj >>= 1; // we are FreeObjRef now
-		FreeObjRef f = obj >> (size-2);
-		f += f & 0x1 ? -1 : 1;
-		f <<= (size - 2);
-		INFO("we are %x, friend is %x, size %d", obj, f, size);
+		FreeObjRef f = obj >> (size-4);
+		f += (f & 0x1) ? -1 : 1;
+		f <<= (size - 4);
+		XXINFO("    we are %x, friend is %x, %d:%d", obj<<1, f<<1, OM.f16[f].type, OM.f16[f].size);
 		
 		if (OM.f16[f].type == 0 && OM.f16[f].size == size) {
+			XXINFO("     Remove friend from list and free up");
 			// our friend is also free so remove friend from list and free the larger block
 			OM.f16[OM.f16[f].prev].next = OM.f16[f].next;
 			OM.f16[OM.f16[f].next].prev = OM.f16[f].prev;
-			OM.f16[f].size = OM.f16[obj].size = size + 1;
-			omem_free(f < obj? f<<1 : obj<<1);
+			f = (obj < f)? obj: f;
+			OM.f16[f].size = size + 1;
+			OM.f16[f].type = 1;
+			omem_free(f<<1);
 			
 		} else {
+			XXINFO("     Friend not free");
 			// our friend is not free, so add this object to the primary free list
-			FreeObj16 *f16 = &OM.f16[obj>>1];
+			FreeObj16 *f16 = &OM.f16[obj];
 			f16->type = 0;
 			f16->size = size;
 			f16->prev = size*1; // primary sentinal
@@ -239,31 +320,20 @@ void omem_free(ORef obj)
 		}
 		
 	}
-	
-	
 }
 
-void dump_free_pages(void)
+void omem_register_class(uint8_t type, ObjClass *kls)
 {
-	PageObjRef *top = g_free_page;
-	while (top != g_free_page_root) {
-		printf("[%.4d:%d] ", *top, OM.p[*top].f8[0].type);
-		fflush(stdout);
-		if ( (top - OM.r)%(OM_OPP*2) == 1) {
-			INFO("---------- %d ", *top - 1);
-			top = (PageObjRef*)&OM.p[*top] - 1;
-		} else {
-			--top;
-		}
-	}
-
+	memcpy(&g_class[type], kls, sizeof(ObjClass));
 }
 
-int omem_page_in_use(ORef obj)
+int omem_page_in_use(PageObjRef page)
 {
-	PageObjRef page = obj / OM_OPP;
+	//~ PageObjRef page = obj / OM_OPP;
 	if (page >= *g_free_page_root)
 		return -2;
+	if (page == 0)
+		return -1;
 	PageObjRef *top = g_free_page;
 	while (top != g_free_page_root) {
 		if ( (top - OM.r)%(OM_OPP*2) == 1) { 
@@ -280,6 +350,12 @@ int omem_page_in_use(ORef obj)
 	return 1;	
 }
 
+void omem_gc(void)
+{
+	
+	
+	
+}
 
 
 #endif

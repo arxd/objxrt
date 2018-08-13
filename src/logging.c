@@ -39,6 +39,11 @@
 #define XINFO(fmt, ...) do{}while(0)
 #endif
 
+#if LOG_LEVEL >= 5
+#define XXINFO(fmt, ...) log_printf("XXInfo", __FILE__, __LINE__, fmt, ## __VA_ARGS__)
+#else
+#define XXINFO(fmt, ...) do{}while(0)
+#endif
 
 
 void log_printf(char*level, char *file, int line, const char *fmt, ...);
